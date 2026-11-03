@@ -59,6 +59,7 @@ const server=net.createServer((socket)=>{
 
       if(index===-1){
         // too big and still no end of headers -> reject
+        //this goes to the up things and again buffer.concat occurs!
         if(request.length>MAX_HEADER_SIZE){
           closing=true;
           socket.end(
