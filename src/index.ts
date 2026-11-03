@@ -3,6 +3,7 @@ import net from "node:net";
 const MAX_HEADER_SIZE=8192;
 const MAX_BODY_SIZE=1024*1024; // 1 MB
 const IDLE_TIMEOUT=10_000;
+const MAX_REQUESTS=100;
 
 // Example: curl.exe -v http://localhost:3000/hello
 //
@@ -112,25 +113,49 @@ const server=net.createServer((socket)=>{
       // split(" ") -> ["GET","/hello","HTTP/1.1"]
       const [method,path,version]=firstLine.split(" ");
 
-      // find the Content-Length header (if any):
-      //   GET example  -> undefined       -> contentLength=0
-      //   POST example -> "Content-Length: 5" -> split(":")[1] = " 5" -> trim -> "5" -> 5
-      const lengthHeader=headers.find(h=>
-        h.toLowerCase().startsWith("content-length:")
+      // collect every Content-Length header:
+      //   GET example  -> []                     -> contentLength=0
+      //   POST example -> ["Content-Length: 5"]  -> contentLength=5
+      const lengthHeaders=headers.filter(h=>
+        /^content-length:/i.test(h)
       );
+
+      // two Content-Length headers -> which one is right? reject
+      if(lengthHeaders.length>1){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      // POST must say how big its body is
+      if(method==="POST"&&lengthHeaders.length===0){
+        closing=true;
+        sendError(socket,"411 Length Required");
+        return;
+      }
+
       let contentLength=0;
-      if(lengthHeader){
-        contentLength=Number(lengthHeader.split(":")[1].trim());
+
+      if(lengthHeaders.length===1){
+        // "Content-Length: 5" -> split(":") -> ["Content-Length"," 5"] -> [1] -> " 5" -> trim -> "5"
+        const value=lengthHeaders[0].split(":")[1].trim();
+
+        // only digits allowed: "5" ok, "abc" / "-5" / "2.5" / "" -> 400
+        if(!/^\d+$/.test(value)){
+          closing=true;
+          sendError(socket,"400 Bad Request");
+          return;
+        }
+
+        contentLength=Number(value);
       }
 
       // validate BEFORE waiting for the body
-      // (a bad Content-Length like "abc" -> NaN would break the math below)
+      // (Content-Length is already checked above: digits only)
       const unsupported=
         version!=="HTTP/1.1"||
         (method!=="GET"&&method!=="POST")||
-        headers.some(h=>/^transfer-encoding\s*:/i.test(h))|| // chunked bodies not supported yet
-        !Number.isInteger(contentLength)||
-        contentLength<0;
+        headers.some(h=>/^transfer-encoding\s*:/i.test(h)); // chunked bodies not supported yet
 
       if(unsupported){
         closing=true;
@@ -171,9 +196,37 @@ const server=net.createServer((socket)=>{
       // routing
       let status="200 OK";
       let body="";
+      
       if(method==="GET"&&path==="/hello"){
         body="Hello from my tcp server";
-      }else if(method==="GET"&&path==="/health"){
+      }else if(method==="GET" && path==="/block"){
+        console.log("Blocking started")
+        const startTime=Date.now();
+        while(Date.now()-startTime<5000){
+          //this shit is blocking
+        }
+        console.log("Blocking finished")
+        body="Blocking completed"
+      }else if(method=="GET" && path=="/nonblock"){
+        console.log("non blocking started")
+        closing=true;
+        setTimeout(()=>{
+          if(socket.destroyed) return;
+          console.log("Non blocking finished")
+          const result="Non blockign completed"
+          const response=
+      "HTTP/1.1 200 OK\r\n"+
+      "Content-Type: text/plain\r\n"+
+      `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+      "Connection: close\r\n"+
+      "\r\n"+
+      result;
+
+    socket.end(response);
+        },5000);
+        return;
+      }
+      else if(method==="GET"&&path==="/health"){
         body="Server is healthy";
       }else if(method==="POST"&&path==="/echo"){
         body=`You sent: ${requestBody}`;
@@ -187,7 +240,9 @@ const server=net.createServer((socket)=>{
 
       // client sent "Connection: close" -> close after this response
       // otherwise HTTP/1.1 keeps the connection open (keep-alive)
-      const shouldClose=headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h));
+      const shouldClose=
+      headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h))||
+      requestsServed>=MAX_REQUESTS;
 
       // response = status line + headers + empty line + body
       const response=
