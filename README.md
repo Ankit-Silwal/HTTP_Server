@@ -8,8 +8,9 @@ The goal is to learn what really happens between `curl` and a server: name resol
 | 1 | TCP connection, sockets, Buffer | ✅ Done |
 | 2 | Keep-alive, routing, validation, idle timeout | ✅ Done |
 | 3 | Request bodies (`Content-Length`), `POST /echo`, `413` | ✅ Done |
-| 4 | Stricter `Content-Length`, `411`, request limit, blocking vs non-blocking | ✅ Done (current `src/index.ts`) |
-| 5 | Header parser into an object, query strings | ⏳ Next |
+| 4 | Stricter `Content-Length`, `411`, request limit, blocking vs non-blocking | ✅ Done |
+| 5 | Worker threads: CPU work off the main thread (`/worker`) | ✅ Done (current `src/`) |
+| 6 | Header parser into an object, query strings | ⏳ Next |
 
 ---
 
@@ -57,7 +58,7 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProc
 
 ## The full code (Phase 1)
 
-> This is the Phase 1 version, which the sections below explain. The current `src/index.ts` is the Phase 4 version, explained in [Phase 4](#phase-4--hardening--the-event-loop).
+> This is the Phase 1 version, which the sections below explain. The current `src/index.ts` is the Phase 5 version, explained in [Phase 5](#phase-5--worker-threads).
 
 ```ts
 import net from "node:net";
@@ -528,7 +529,7 @@ Phase 1 handled **one request per TCP connection** and always answered `200 OK`.
 
 ### Full code (Phase 2 version)
 
-> This is the Phase 2 version. Request bodies are added in [Phase 3](#phase-3--request-bodies), and the current code is in [Phase 4](#phase-4--hardening--the-event-loop).
+> This is the Phase 2 version. Request bodies are added in [Phase 3](#phase-3--request-bodies), and the current code is in [Phase 5](#phase-5--worker-threads).
 
 ```ts
 import net from "node:net";
@@ -1446,7 +1447,7 @@ Phase 3 trusted `Content-Length` a bit too much. Phase 4 makes that check strict
 | Requests per connection | Unlimited | `MAX_REQUESTS=100`, then `Connection: close` |
 | New routes | | `GET /block`, `GET /nonblock` |
 
-### Full code (Phase 4, current `src/index.ts`)
+### Full code (Phase 4 version)
 
 ```ts
 import net from "node:net";
@@ -1951,4 +1952,532 @@ curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/hello
 | Blocking route | `while` loop in `/block` | Shows one busy callback freezes every client |
 | Non-blocking route | `setTimeout` in `/nonblock` | Shows waiting without holding the thread |
 
-**Next: Phase 5** will turn the headers into an object (`{ host: "localhost:3000", ... }`), handle query strings (`/hello?name=x`), and move the parsing into its own `parser.ts`.
+See [Phase 5](#phase-5--worker-threads) for what changed next.
+
+---
+
+## **Phase 5 — Worker Threads**
+
+Phase 4 showed the problem: CPU-heavy work (`/block`) freezes the whole server, because all our JavaScript runs on **one thread**. `setTimeout` (`/nonblock`) only helps when we're *waiting*. When we really need to *compute* for 5 seconds, a timer can't help.
+
+Phase 5 moves the computation onto a **worker thread**: a second JavaScript thread inside the same Node process, with its own event loop. The main thread keeps serving clients while the worker crunches numbers.
+
+| | `/block` (Phase 4) | `/nonblock` (Phase 4) | `/worker` (Phase 5) |
+|---|---|---|---|
+| Does real CPU work? | ✅ | ❌ (just waits) | ✅ |
+| Runs on | Main thread | Main thread (timer) | **Separate worker thread** |
+| Other clients during the 5s | Frozen | Served | Served |
+
+```
+HTTP_Server/
+├── src/
+│   ├── index.ts              ← main thread: TCP server + routing
+│   └── compute-worker.cjs    ← NEW: runs on a worker thread
+├── package.json
+└── README.md
+```
+
+### Full code (Phase 5, current version)
+
+`src/compute-worker.cjs`:
+
+```js
+const { parentPort,threadId }=require("node:worker_threads");
+
+console.log("Worker thread started:",threadId);
+
+const start=Date.now();
+let count=0;
+
+// burns CPU for ~5 seconds, but on THIS thread, not the server's main thread
+while(Date.now()-start<5000){
+  count++;
+}
+
+console.log("Worker finished:",threadId);
+
+// send the result back to the main thread (index.ts)
+parentPort.postMessage(count);
+```
+
+`src/index.ts`:
+
+```ts
+import net from "node:net";
+import { Worker,threadId } from "node:worker_threads";
+
+// where the worker file is, relative to THIS file (works from any folder)
+// (not using node:path here because "path" is already our request path variable)
+const WORKER_FILE=new URL("./compute-worker.cjs",import.meta.url);
+
+const MAX_HEADER_SIZE=8192;
+const MAX_BODY_SIZE=1024*1024; // 1 MB
+const IDLE_TIMEOUT=10_000;
+const MAX_REQUESTS=100;
+
+// Example: curl.exe -v http://localhost:3000/hello
+//
+// What curl sends over TCP (\r\n written out, normally invisible):
+//
+//   GET /hello HTTP/1.1\r\n          -> bytes  0-20
+//   Host: localhost:3000\r\n         -> bytes 21-42
+//   User-Agent: curl/8.21.0\r\n      -> bytes 43-67
+//   Accept: */*                      -> bytes 68-78
+//   \r\n\r\n                         -> bytes 79-82 (end of headers)
+//
+// Raw bytes (hex) in the Buffer:
+//   G  E  T     /  h  e  l  l  o
+//   47 45 54 20 2f 68 65 6c 6c 6f ...
+//
+// With keep-alive, the same connection can carry more requests,
+// so the buffer can hold the next one right after byte 82:
+//
+//   [ request 1: bytes 0-82 ][ request 2: bytes 83-... ]
+//
+// Example with a body: curl.exe -v -d "hello" http://localhost:3000/echo
+//
+//   POST /echo HTTP/1.1\r\n                                -> bytes   0-20
+//   Host: localhost:3000\r\n                               -> bytes  21-42
+//   User-Agent: curl/8.21.0\r\n                            -> bytes  43-67
+//   Accept: */*\r\n                                        -> bytes  68-80
+//   Content-Length: 5\r\n                                  -> bytes  81-99
+//   Content-Type: application/x-www-form-urlencoded        -> bytes 100-146
+//   \r\n\r\n                                               -> bytes 147-150 (index=147)
+//   hello                                                  -> bytes 151-155 (the body)
+//
+//   [ headers: 0-146 ][\r\n\r\n: 147-150][ body: 151-155 ][ next request: 156-... ]
+
+// small helper so every error response looks the same
+function sendError(socket:net.Socket,status:string){
+  socket.end(
+    `HTTP/1.1 ${status}\r\n`+
+    "Content-Length: 0\r\n"+
+    "Connection: close\r\n"+
+    "\r\n"
+  );
+}
+
+const server=net.createServer((socket)=>{
+  console.log("Client is connected");
+
+  // empty bucket for this connection -> <Buffer >, length 0
+  let request=Buffer.alloc(0);
+  let requestsServed=0;
+  let closing=false;
+
+  // no data for 10s -> close the idle connection
+  socket.setTimeout(IDLE_TIMEOUT);
+  socket.on("timeout",()=>{
+    console.log("Idle connection timeout");
+    closing=true;
+    socket.end();
+  });
+
+  socket.on("data",(chunk:Buffer)=>{
+    if(closing) return;
+
+    // TCP can split a request into pieces, so we keep adding them:
+    //   data #1 chunk -> "GET /hello HTTP/1.1\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\n"
+    //   data #2 chunk -> "Host: localhost:3000\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\n"
+    //   data #3 chunk -> "User-Agent: curl/8.21.0\r\nAccept: */*\r\n\r\n"
+    //   request       -> full headers (now contains \r\n\r\n)
+    request=Buffer.concat([request,chunk]);
+
+    // one chunk can contain several requests -> handle them one by one
+    while(true){
+      // where do the headers end?
+      //   not arrived yet -> -1
+      //   GET example     -> 79
+      //   POST example    -> 147
+      const index=request.indexOf("\r\n\r\n");
+
+      if(index===-1){
+        // too big and still no end of headers -> reject
+        // otherwise return, the next "data" event runs Buffer.concat again
+        if(request.length>MAX_HEADER_SIZE){
+          closing=true;
+          sendError(socket,"431 Request Header Fields Too Large");
+        }
+        return; // wait for more data
+      }
+
+      // headers finished but bigger than the limit -> reject
+      if(index+4>MAX_HEADER_SIZE){
+        closing=true;
+        sendError(socket,"431 Request Header Fields Too Large");
+        return;
+      }
+
+      // subarray(0,79) -> header bytes only (without \r\n\r\n)
+      // toString()     -> bytes to text:
+      //   "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\nUser-Agent: curl/8.21.0\r\nAccept: */*"
+      const text=request.subarray(0,index).toString();
+
+      // split("\r\n") ->
+      //   firstLine = "GET /hello HTTP/1.1"
+      //   headers   = ["Host: localhost:3000","User-Agent: curl/8.21.0","Accept: */*"]
+      const [firstLine,...headers]=text.split("\r\n");
+
+      // split(" ") -> ["GET","/hello","HTTP/1.1"]
+      const [method,path,version]=firstLine.split(" ");
+
+      // collect every Content-Length header:
+      //   GET example  -> []                     -> contentLength=0
+      //   POST example -> ["Content-Length: 5"]  -> contentLength=5
+      const lengthHeaders=headers.filter(h=>
+        /^content-length:/i.test(h)
+      );
+
+      // two Content-Length headers -> which one is right? reject
+      if(lengthHeaders.length>1){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      // POST must say how big its body is
+      if(method==="POST"&&lengthHeaders.length===0){
+        closing=true;
+        sendError(socket,"411 Length Required");
+        return;
+      }
+
+      let contentLength=0;
+
+      if(lengthHeaders.length===1){
+        // "Content-Length: 5" -> split(":") -> ["Content-Length"," 5"] -> [1] -> " 5" -> trim -> "5"
+        const value=lengthHeaders[0].split(":")[1].trim();
+
+        // only digits allowed: "5" ok, "abc" / "-5" / "2.5" / "" -> 400
+        if(!/^\d+$/.test(value)){
+          closing=true;
+          sendError(socket,"400 Bad Request");
+          return;
+        }
+
+        contentLength=Number(value);
+      }
+
+      // validate BEFORE waiting for the body
+      // (Content-Length is already checked above: digits only)
+      const unsupported=
+        version!=="HTTP/1.1"||
+        (method!=="GET"&&method!=="POST")||
+        headers.some(h=>/^transfer-encoding\s*:/i.test(h)); // chunked bodies not supported yet
+
+      if(unsupported){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      if(contentLength>MAX_BODY_SIZE){
+        closing=true;
+        sendError(socket,"413 Content Too Large");
+        return;
+      }
+
+      // where the body is in the buffer (POST example):
+      //   bodyStart   = 147 + 4 = 151
+      //   totalLength = 151 + 5 = 156  -> this request ends at byte 155
+      const bodyStart=index+4;
+      const totalLength=bodyStart+contentLength;
+
+      // body not fully arrived yet -> wait for more data
+      // (we keep the headers in the buffer and parse them again next time)
+      if(request.length<totalLength){
+        return;
+      }
+
+      // subarray(151,156) -> "hello"
+      const requestBody=request.subarray(bodyStart,totalLength).toString();
+
+      // cut off this whole request (headers + body) and keep whatever comes after it:
+      //   only one request -> request = <Buffer >
+      //   two requests     -> request = bytes of request 2
+      request=request.subarray(totalLength);
+
+      console.log("Method:",method);
+      console.log("Path:",path);
+      console.log("Body:",requestBody);
+
+      // routing
+      let status="200 OK";
+      let body="";
+      
+      if(method==="GET"&&path==="/hello"){
+        body="Hello from my tcp server";
+      }else if(method==="GET"&&path==="/worker"){
+        console.log("Main thread:",threadId);
+        console.log("Creating worker");
+
+        // runs compute-worker.cjs on a separate thread
+        const worker=new Worker(WORKER_FILE);
+
+        // one delayed response, then this TCP connection closes
+        closing=true;
+
+        let finished=false;
+
+        // worker called parentPort.postMessage(count)
+        worker.once("message",(count)=>{
+          finished=true;
+          if(socket.destroyed) return;
+
+          const result=`Worker completed ${count} iterations`;
+          const response=
+            "HTTP/1.1 200 OK\r\n"+
+            "Content-Type: text/plain\r\n"+
+            `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+            "Connection: close\r\n"+
+            "\r\n"+
+            result;
+
+          socket.end(response);
+        });
+
+        // worker threw an exception
+        worker.once("error",(err:Error)=>{
+          finished=true;
+          console.log("Worker error:",err.message);
+          if(!socket.destroyed){
+            sendError(socket,"500 Internal Server Error");
+          }
+        });
+
+        // worker stopped without sending a result
+        worker.once("exit",(code)=>{
+          if(!finished&&!socket.destroyed){
+            console.log("Worker exited:",code);
+            sendError(socket,"500 Internal Server Error");
+          }
+        });
+
+        // client hung up -> stop the worker, nobody wants the answer
+        socket.once("close",()=>{
+          if(!finished){
+            void worker.terminate();
+          }
+        });
+
+        return;
+      }else if(method==="GET" && path==="/block"){
+        console.log("Main thread:",threadId);
+        console.log("Blocking started")
+        const startTime=Date.now();
+        while(Date.now()-startTime<5000){
+          //this shit is blocking
+        }
+        console.log("Blocking finished")
+        body="Blocking completed"
+      }else if(method=="GET" && path=="/nonblock"){
+        console.log("non blocking started")
+        closing=true;
+        setTimeout(()=>{
+          if(socket.destroyed) return;
+          console.log("Non blocking finished")
+          const result="Non blockign completed"
+          const response=
+      "HTTP/1.1 200 OK\r\n"+
+      "Content-Type: text/plain\r\n"+
+      `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+      "Connection: close\r\n"+
+      "\r\n"+
+      result;
+
+    socket.end(response);
+        },5000);
+        return;
+      }
+      else if(method==="GET"&&path==="/health"){
+        body="Server is healthy";
+      }else if(method==="POST"&&path==="/echo"){
+        body=`You sent: ${requestBody}`;
+      }else{
+        status="404 Not Found";
+        body="Route not found";
+      }
+
+      requestsServed++;
+      console.log("Requests on connection:",requestsServed);
+
+      // client sent "Connection: close" -> close after this response
+      // otherwise HTTP/1.1 keeps the connection open (keep-alive)
+      const shouldClose=
+      headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h))||
+      requestsServed>=MAX_REQUESTS;
+
+      // response = status line + headers + empty line + body
+      const response=
+        `HTTP/1.1 ${status}\r\n`+
+        "Content-Type: text/plain\r\n"+
+        `Content-Length: ${Buffer.byteLength(body)}\r\n`+
+        `Connection: ${shouldClose?"close":"keep-alive"}\r\n`+
+        "\r\n"+
+        body;
+
+      if(shouldClose){
+        closing=true;
+        socket.end(response); // send and close
+        return;
+      }
+
+      socket.write(response); // send and keep the connection open
+    }
+  });
+
+  socket.on("close",()=>{
+    console.log("Client disconnected");
+  });
+
+  socket.on("error",(err)=>{
+    console.log("Socket error:",err.message);
+  });
+});
+
+// 0.0.0.0 -> listen on every address this PC has (localhost, Wi-Fi IP, ...)
+server.listen(3000,"0.0.0.0",()=>{
+  console.log("TCP server is running on port 3000");
+});
+```
+
+---
+
+### 5.1 The worker file
+
+```js
+const { parentPort,threadId }=require("node:worker_threads");
+```
+
+| Name | What it is |
+|---|---|
+| `parentPort` | The message channel back to the thread that created this worker |
+| `threadId` | This thread's number. The main thread is `0`, the first worker is `1`, and so on |
+
+```js
+while(Date.now()-start<5000){
+  count++;
+}
+```
+
+The same kind of busy loop as `/block`. It still hogs a thread for 5 seconds, but now that thread is the **worker**, not the one running the server.
+
+```js
+parentPort.postMessage(count);
+```
+
+Sends the result to the main thread. Threads don't share variables; they talk by **sending messages** (the value is copied across).
+
+**Why `.cjs`?** The extension forces Node to treat the file as CommonJS (`require`), even though `package.json` says `"type": "module"`. Node runs it directly, with no TypeScript step.
+
+---
+
+### 5.2 Finding the worker file
+
+```ts
+import { Worker,threadId } from "node:worker_threads";
+
+const WORKER_FILE=new URL("./compute-worker.cjs",import.meta.url);
+```
+
+`import.meta.url` is the URL of `index.ts` itself (`file:///C:/.../src/index.ts`). `new URL("./compute-worker.cjs", ...)` resolves the worker file **next to it**, so it's found no matter which folder you run `npm start` from.
+
+> Why not `path.resolve("src","compute-worker.cjs")`? Two reasons:
+> 1. It depends on the current folder: run from somewhere else and the file isn't found.
+> 2. Our request handler already has a variable named `path` (`const [method,path,version]=...`). Inside the handler, that string would shadow an imported `path` module, and `path.resolve` would crash.
+
+---
+
+### 5.3 The `/worker` route
+
+```ts
+const worker=new Worker(WORKER_FILE);
+closing=true;
+let finished=false;
+```
+
+`new Worker(...)` starts a new thread running the file and returns **immediately**. The main thread does not wait. Like `/nonblock`, the response is sent later, so we set `closing=true` and `return` at the end of the route.
+
+Then we register what to do when something happens to the worker:
+
+| Event | When | What we do |
+|---|---|---|
+| `message` | Worker called `postMessage(count)` | Build the `200 OK` response and `socket.end(...)` |
+| `error` | Worker threw an exception | Log it, send `500 Internal Server Error` |
+| `exit` | Worker stopped | If no result came first, send `500` |
+| `socket` `close` | Client hung up (Ctrl + C) | `worker.terminate()`: nobody wants the answer, stop wasting CPU |
+
+The `finished` flag makes sure only **one** response is sent: once `message` or `error` has run, `exit` and `close` know there's nothing left to do. `if(socket.destroyed) return` avoids writing to a client that is already gone.
+
+---
+
+### 5.4 Timeline
+
+```
+main thread (threadId 0)                   worker thread (threadId 1)
+────────────────────────                   ──────────────────────────
+t=0s  GET /worker
+      new Worker(...)  ──── starts ──────►  while loop running...
+      return (thread is free)                count++ count++ ...
+t=1s  GET /hello  -> answered instantly      count++ count++ ...
+t=2s  GET /health -> answered instantly      count++ count++ ...
+t=5s                ◄── postMessage(count) ─ done
+      "message" event -> socket.end(response)
+```
+
+Compare with `/block`, where the `GET /hello` at t=1s would wait until t=5s.
+
+---
+
+### 5.5 Try it
+
+```powershell
+npm start
+```
+
+Two terminals:
+
+```powershell
+# Terminal 1
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/worker
+
+# Terminal 2, right after starting terminal 1
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/hello
+```
+
+| Terminal 1 route | Terminal 1 time | `/hello` time in terminal 2 |
+|---|---|---|
+| `/block` | ~5s | ~4–5s (frozen) |
+| `/worker` | ~5s | ~0.003s (served) |
+
+Expected server log:
+
+```
+Main thread: 0
+Creating worker
+Worker thread started: 1
+Method: GET
+Path: /hello
+...
+Worker finished: 1
+```
+
+The `/hello` request is handled **between** "Worker thread started" and "Worker finished": proof that the main thread was free.
+
+---
+
+## Phase 5 summary
+
+| Feature | Code | Purpose |
+|---|---|---|
+| Worker file | `src/compute-worker.cjs` | CPU work that runs off the main thread |
+| Start a worker | `new Worker(WORKER_FILE)` | Creates a second JavaScript thread |
+| Find the file | `new URL(...,import.meta.url)` | Works from any folder, no clash with `path` |
+| Get the result | `worker.once("message",...)` | Reply to the client when the work is done |
+| Handle failure | `error` / `exit` → `500` | Client always gets an answer |
+| Cleanup | `socket.once("close",...)` → `terminate()` | Don't keep computing for a client who left |
+| Thread ids | `threadId` | See which thread ran which code |
+
+**Next: Phase 6** will turn the headers into an object (`{ host: "localhost:3000", ... }`), handle query strings (`/hello?name=x`), and move the parsing into its own `parser.ts`.

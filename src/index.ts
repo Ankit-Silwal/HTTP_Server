@@ -1,4 +1,9 @@
 import net from "node:net";
+import { Worker,threadId } from "node:worker_threads";
+
+// where the worker file is, relative to THIS file (works from any folder)
+// (not using node:path here because "path" is already our request path variable)
+const WORKER_FILE=new URL("./compute-worker.cjs",import.meta.url);
 
 const MAX_HEADER_SIZE=8192;
 const MAX_BODY_SIZE=1024*1024; // 1 MB
@@ -199,7 +204,62 @@ const server=net.createServer((socket)=>{
       
       if(method==="GET"&&path==="/hello"){
         body="Hello from my tcp server";
+      }else if(method==="GET"&&path==="/worker"){
+        console.log("Main thread:",threadId);
+        console.log("Creating worker");
+
+        // runs compute-worker.cjs on a separate thread
+        const worker=new Worker(WORKER_FILE);
+
+        // one delayed response, then this TCP connection closes
+        closing=true;
+
+        let finished=false;
+
+        // worker called parentPort.postMessage(count)
+        worker.once("message",(count)=>{
+          finished=true;
+          if(socket.destroyed) return;
+
+          const result=`Worker completed ${count} iterations`;
+          const response=
+            "HTTP/1.1 200 OK\r\n"+
+            "Content-Type: text/plain\r\n"+
+            `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+            "Connection: close\r\n"+
+            "\r\n"+
+            result;
+
+          socket.end(response);
+        });
+
+        // worker threw an exception
+        worker.once("error",(err:Error)=>{
+          finished=true;
+          console.log("Worker error:",err.message);
+          if(!socket.destroyed){
+            sendError(socket,"500 Internal Server Error");
+          }
+        });
+
+        // worker stopped without sending a result
+        worker.once("exit",(code)=>{
+          if(!finished&&!socket.destroyed){
+            console.log("Worker exited:",code);
+            sendError(socket,"500 Internal Server Error");
+          }
+        });
+
+        // client hung up -> stop the worker, nobody wants the answer
+        socket.once("close",()=>{
+          if(!finished){
+            void worker.terminate();
+          }
+        });
+
+        return;
       }else if(method==="GET" && path==="/block"){
+        console.log("Main thread:",threadId);
         console.log("Blocking started")
         const startTime=Date.now();
         while(Date.now()-startTime<5000){
