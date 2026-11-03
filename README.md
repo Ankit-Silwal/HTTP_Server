@@ -3,6 +3,12 @@
 A tiny HTTP server built directly on **raw TCP sockets** (`node:net`), without Node's `http` module or Express.
 The goal is to learn what really happens between `curl` and a server: name resolution, TCP connections, bytes, and the HTTP text format.
 
+| Phase | Topic | Status |
+|---|---|---|
+| 1 | TCP connection, sockets, Buffer | ✅ Done |
+| 2 | Keep-alive, routing, validation, idle timeout | ✅ Done (current `src/index.ts`) |
+| 3 | Full header parser and request bodies | ⏳ Next |
+
 ---
 
 ## **Phase 1 — TCP Connection**
@@ -30,10 +36,12 @@ Output:
 TCP server is running on port 3000
 ```
 
-Send a request from another terminal:
+Send requests from another terminal:
 
 ```powershell
-curl.exe -v http://localhost:3000/hello
+curl.exe -v http://localhost:3000/hello     # 200  Hello from my tcp server
+curl.exe -v http://localhost:3000/health    # 200  Server is healthy
+curl.exe -v http://localhost:3000/abc       # 404  Route not found
 ```
 
 Stop the server with **Ctrl + C**. If port 3000 is still busy after that:
@@ -45,6 +53,8 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProc
 ---
 
 ## The full code (Phase 1)
+
+> This is the Phase 1 version, which the sections below explain. The current `src/index.ts` is the Phase 2 version, explained in [Phase 2](#phase-2--keep-alive-routing--validation).
 
 ```ts
 import net from "node:net";
@@ -498,4 +508,266 @@ console.log("7. Parts:", firstLine.split(" "));
 | HTTP response | The server sent `200 OK` with a 25-byte body |
 | TCP close | `socket.end()` closed this connection; the server kept running |
 
-**Next: Phase 2** will parse every header into an object and add routes (`/health`, `/tasks`, `404`).
+---
+
+## **Phase 2 — Keep-Alive, Routing & Validation**
+
+Phase 1 handled **one request per TCP connection** and always answered `200 OK`. Phase 2 changes that:
+
+| | Phase 1 | Phase 2 |
+|---|---|---|
+| Requests per connection | 1, then close | Many (**keep-alive**) |
+| Routes | Every path gives the same reply | `/hello`, `/health`, others get `404` |
+| Bad requests | Not checked | `400 Bad Request` |
+| Idle clients | Stay connected forever | Closed after **10 seconds** |
+| Flag | `handled` (done after 1 request) | `closing` (stop only when closing) |
+| Parsing | Once per `data` event | A `while` loop handles every request in the buffer |
+
+The full code is in [`src/index.ts`](src/index.ts). The comments there show the same byte-by-byte example used below.
+
+---
+
+### 2.1 Keep-alive: one connection, many requests
+
+Opening a TCP connection costs a handshake (`SYN → SYN-ACK → ACK`). Opening one for **every** request wastes time. In HTTP/1.1, connections stay open by default, so the client can send the next request on the same socket.
+
+```
+Phase 1 (Connection: close)              Phase 2 (keep-alive)
+
+connect ─► GET /hello ─► 200 ─► close     connect ─► GET /hello  ─► 200
+connect ─► GET /health ─► 200 ─► close             ─► GET /health ─► 200
+                                                    ─► ... idle 10s ─► close
+```
+
+How the server decides:
+
+```ts
+// client sent "Connection: close" -> close after this response
+// otherwise HTTP/1.1 keeps the connection open (keep-alive)
+const shouldClose=headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h));
+```
+
+| Client sent | Server replies | Server then calls |
+|---|---|---|
+| no `Connection` header | `Connection: keep-alive` | `socket.write(response)`, so the socket **stays open** |
+| `Connection: close` | `Connection: close` | `socket.end(response)`, so the socket **closes** |
+
+`socket.write()` sends data and keeps the socket open. `socket.end()` sends data and then closes it.
+
+The regex `/^connection\s*:\s*close\s*$/i` matches `Connection: close`, `connection:close`, `CONNECTION :  close`, and so on. `i` means case-insensitive, and `\s*` allows optional spaces.
+
+**Try it.** Give curl two URLs and it reuses the same connection for both:
+
+```powershell
+curl.exe -v http://localhost:3000/hello http://localhost:3000/health
+```
+
+curl reports that it is **re-using the existing connection**, and the server logs:
+
+```
+Client is connected
+Method: GET
+Path: /hello
+Requests on connection: 1
+Method: GET
+Path: /health
+Requests on connection: 2      ← same connection, second request
+```
+
+Force a close:
+
+```powershell
+curl.exe -v -H "Connection: close" http://localhost:3000/hello
+```
+
+---
+
+### 2.2 The `while(true)` loop: more than one request in the buffer
+
+With keep-alive, one `data` chunk can contain **two requests back to back** (this is called *pipelining*), or one full request plus **half** of the next one. So after handling a request, we must not throw the buffer away. We **cut off** only the part we used and loop again.
+
+Using the curl `/hello` request from Phase 1 (83 bytes in total), sent twice:
+
+```
+byte:   0 ............. 78  79-82   83 ............ 161  162-165
+       [ request 1 headers ][\r\n\r\n][ request 2 headers ][\r\n\r\n]
+```
+
+```ts
+while(true){
+  const index=request.indexOf("\r\n\r\n");     // 1st loop: 79
+  if(index===-1) return;                        // no complete request left -> wait
+
+  const text=request.subarray(0,index).toString();   // bytes 0-78 -> request 1 as text
+  request=request.subarray(index+4);                 // drop bytes 0-82, keep 83-165
+  ...                                                // respond to request 1
+}                                                    // loop again
+```
+
+| Loop | `request` holds | `indexOf` | What happens |
+|---|---|---|---|
+| 1 | request 1 + request 2 (166 bytes) | `79` | answer request 1, keep bytes 83–165 |
+| 2 | request 2 (83 bytes) | `79` | answer request 2, keep nothing |
+| 3 | `<Buffer >` (empty) | `-1` | `return`, and wait for the next `data` event |
+
+**Why `index+4`?** `index` is where `\r\n\r\n` **starts**, and that sequence is 4 bytes long. So `index+4` is the first byte **after** the headers, which is where the next request begins.
+
+`subarray()` doesn't copy any bytes. It just creates a smaller view onto the same memory.
+
+---
+
+### 2.3 Splitting first line vs headers
+
+```ts
+const [firstLine,...headers]=text.split("\r\n");
+```
+
+`...headers` (rest syntax) means "put everything after the first item into an array":
+
+```ts
+text.split("\r\n") ===
+  ["GET /hello HTTP/1.1", "Host: localhost:3000", "User-Agent: curl/8.21.0", "Accept: */*"]
+
+firstLine === "GET /hello HTTP/1.1"
+headers   === ["Host: localhost:3000", "User-Agent: curl/8.21.0", "Accept: */*"]
+```
+
+```ts
+const [method,path,version]=firstLine.split(" ");
+// method = "GET", path = "/hello", version = "HTTP/1.1"
+```
+
+---
+
+### 2.4 Validation: `400 Bad Request`
+
+```ts
+const unsupported=
+  version!=="HTTP/1.1"||
+  method!=="GET"||
+  headers.some(h=>/^(content-length|transfer-encoding)\s*:/i.test(h));
+```
+
+The server rejects the request and closes the connection if:
+
+| Check | Example that fails | Why |
+|---|---|---|
+| `version!=="HTTP/1.1"` | `GET / HTTP/1.0` | We only implement HTTP/1.1 rules, such as keep-alive by default |
+| `method!=="GET"` | `POST /hello` | Other methods aren't supported yet |
+| has `Content-Length` or `Transfer-Encoding` | `curl.exe -d "x" ...` | The request has a **body**, which we don't read yet |
+
+**Why rejecting bodies matters:** our loop treats the bytes after `\r\n\r\n` as the **next request**. If a client sent a body such as `hello`, those 5 bytes would stay in the buffer and be parsed as the start of a fake second request. Rejecting bodies until Phase 3 reads them properly avoids that bug. This class of bug is the basis of real attacks called *request smuggling*.
+
+`headers.some(...)` returns `true` if **at least one** header matches.
+
+Try it:
+
+```powershell
+curl.exe -v -X POST http://localhost:3000/hello          # 400 (method)
+curl.exe -v --http1.0 http://localhost:3000/hello        # 400 (version)
+```
+
+---
+
+### 2.5 Routing: `200` vs `404`
+
+```ts
+let status="200 OK";
+let body="";
+if(path==="/hello"){
+  body="Hello from my tcp server";
+}else if(path==="/health"){
+  body="Server is healthy";
+}else{
+  status="404 Not Found";
+  body="Route not found";
+}
+```
+
+| Path | Status | Body | `Content-Length` |
+|---|---|---|---|
+| `/hello` | `200 OK` | `Hello from my tcp server` | 24 |
+| `/health` | `200 OK` | `Server is healthy` | 17 |
+| anything else | `404 Not Found` | `Route not found` | 15 |
+
+The path is compared exactly, so `/hello?name=x` and `/hello/` also get `404`. Query strings come later.
+
+A `404` keeps the connection open, because the request itself was valid. Only the route didn't exist. A `400` closes it, because we can no longer trust what is in the buffer.
+
+**`Content-Length` matters even more now.** With keep-alive the connection stays open, so the client can't wait for the connection to close to know the body has ended. It reads exactly `Content-Length` bytes, and anything after that belongs to the next response.
+
+---
+
+### 2.6 Idle timeout
+
+```ts
+socket.setTimeout(IDLE_TIMEOUT);   // 10_000 ms = 10 seconds
+socket.on("timeout",()=>{
+  console.log("Idle connection timeout");
+  closing=true;
+  socket.end();
+});
+```
+
+Every open connection uses memory and a file handle. With keep-alive, a client could connect and then sit there forever. `setTimeout` fires the `"timeout"` event after **10 seconds with no activity**. The timer **restarts** every time data is sent or received, so busy connections are never cut off.
+
+`10_000` is just `10000`. The `_` is a digit separator for readability.
+
+---
+
+### 2.7 Header size limit: `431`
+
+There are two checks, because there are two ways headers can be too big:
+
+```ts
+// 1. still no \r\n\r\n and the buffer is already over 8192 bytes
+if(index===-1){
+  if(request.length>MAX_HEADER_SIZE){ ...431... }
+  return;
+}
+
+// 2. \r\n\r\n was found, but the headers themselves are over 8192 bytes
+if(index+4>MAX_HEADER_SIZE){ ...431... }
+```
+
+Without the first check, a client could send endless bytes with no `\r\n\r\n`, and the buffer would keep growing until memory runs out.
+
+---
+
+### 2.8 The `closing` flag
+
+```ts
+if(closing) return;   // at the top of the "data" handler
+```
+
+`closing` is set to `true` whenever we call `socket.end()`: on a `400`, a `431`, `Connection: close`, or a timeout. After that, any bytes still arriving are ignored, so we never write to a socket that is shutting down.
+
+---
+
+### 2.9 Events on one connection
+
+```
+"connection"  → Client is connected
+"data"        → bytes arrive → while loop → 0, 1 or many responses
+"data"        → more bytes ...
+"timeout"     → 10 s idle → socket.end()
+"close"       → Client disconnected
+"error"       → e.g. client vanished (ECONNRESET), logged instead of crashing the server
+```
+
+---
+
+## Phase 2 summary
+
+| Feature | Code | Purpose |
+|---|---|---|
+| Keep-alive | `socket.write()` vs `socket.end()` | Reuse one TCP connection for many requests |
+| Request loop | `while(true)` + `subarray(index+4)` | Handle several requests in one buffer |
+| Rest split | `[firstLine,...headers]` | Separate the request line from the headers |
+| Validation | `unsupported` → `400` | Reject what we can't parse safely |
+| Routing | `if / else if / else` → `404` | Different reply per path |
+| Idle timeout | `socket.setTimeout(10_000)` | Free connections nobody uses |
+| Size limit | `MAX_HEADER_SIZE` → `431` | Stop endless headers from eating memory |
+| Request count | `requestsServed` | Shows keep-alive working |
+
+**Next: Phase 3** will parse every header into an object (`{ host: "localhost:3000", ... }`), read request bodies using `Content-Length`, and support `POST`.
