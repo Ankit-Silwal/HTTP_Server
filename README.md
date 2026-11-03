@@ -6,8 +6,10 @@ The goal is to learn what really happens between `curl` and a server: name resol
 | Phase | Topic | Status |
 |---|---|---|
 | 1 | TCP connection, sockets, Buffer | ✅ Done |
-| 2 | Keep-alive, routing, validation, idle timeout | ✅ Done (current `src/index.ts`) |
-| 3 | Full header parser and request bodies | ⏳ Next |
+| 2 | Keep-alive, routing, validation, idle timeout | ✅ Done |
+| 3 | Request bodies (`Content-Length`), `POST /echo`, `413` | ✅ Done |
+| 4 | Stricter `Content-Length`, `411`, request limit, blocking vs non-blocking | ✅ Done (current `src/index.ts`) |
+| 5 | Header parser into an object, query strings | ⏳ Next |
 
 ---
 
@@ -42,6 +44,7 @@ Send requests from another terminal:
 curl.exe -v http://localhost:3000/hello     # 200  Hello from my tcp server
 curl.exe -v http://localhost:3000/health    # 200  Server is healthy
 curl.exe -v http://localhost:3000/abc       # 404  Route not found
+curl.exe -v -d "hello" http://localhost:3000/echo   # 200  You sent: hello
 ```
 
 Stop the server with **Ctrl + C**. If port 3000 is still busy after that:
@@ -54,7 +57,7 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProc
 
 ## The full code (Phase 1)
 
-> This is the Phase 1 version, which the sections below explain. The current `src/index.ts` is the Phase 2 version, explained in [Phase 2](#phase-2--keep-alive-routing--validation).
+> This is the Phase 1 version, which the sections below explain. The current `src/index.ts` is the Phase 4 version, explained in [Phase 4](#phase-4--hardening--the-event-loop).
 
 ```ts
 import net from "node:net";
@@ -523,7 +526,9 @@ Phase 1 handled **one request per TCP connection** and always answered `200 OK`.
 | Flag | `handled` (done after 1 request) | `closing` (stop only when closing) |
 | Parsing | Once per `data` event | A `while` loop handles every request in the buffer |
 
-### Full code (Phase 2, current `src/index.ts`)
+### Full code (Phase 2 version)
+
+> This is the Phase 2 version. Request bodies are added in [Phase 3](#phase-3--request-bodies), and the current code is in [Phase 4](#phase-4--hardening--the-event-loop).
 
 ```ts
 import net from "node:net";
@@ -949,4 +954,1001 @@ if(closing) return;   // at the top of the "data" handler
 | Size limit | `MAX_HEADER_SIZE` → `431` | Stop endless headers from eating memory |
 | Request count | `requestsServed` | Shows keep-alive working |
 
-**Next: Phase 3** will parse every header into an object (`{ host: "localhost:3000", ... }`), read request bodies using `Content-Length`, and support `POST`.
+**Next: Phase 3** reads request bodies using `Content-Length` and supports `POST`.
+
+---
+
+## **Phase 3 — Request Bodies**
+
+Up to Phase 2, a request was **only headers**, and anything with a body got a `400`. Phase 3 reads the **body** that comes after the headers, so clients can send data with `POST`.
+
+| | Phase 2 | Phase 3 |
+|---|---|---|
+| Methods | `GET` only | `GET` and `POST` |
+| `Content-Length` header | Rejected with `400` | Read and used to find the body |
+| Request ends at | `index+4` (end of headers) | `index+4+contentLength` (end of body) |
+| New routes | | `POST /echo` replies with what you sent |
+| New errors | | `400` for a bad `Content-Length`, `413` for a body over 1 MB |
+| Error responses | Written out 4 times | One `sendError()` helper |
+| Routing | By path only | By **method and path** |
+
+### Full code (Phase 3 version)
+
+```ts
+import net from "node:net";
+
+const MAX_HEADER_SIZE=8192;
+const MAX_BODY_SIZE=1024*1024; // 1 MB
+const IDLE_TIMEOUT=10_000;
+
+// Example: curl.exe -v http://localhost:3000/hello
+//
+// What curl sends over TCP (\r\n written out, normally invisible):
+//
+//   GET /hello HTTP/1.1\r\n          -> bytes  0-20
+//   Host: localhost:3000\r\n         -> bytes 21-42
+//   User-Agent: curl/8.21.0\r\n      -> bytes 43-67
+//   Accept: */*                      -> bytes 68-78
+//   \r\n\r\n                         -> bytes 79-82 (end of headers)
+//
+// Raw bytes (hex) in the Buffer:
+//   G  E  T     /  h  e  l  l  o
+//   47 45 54 20 2f 68 65 6c 6c 6f ...
+//
+// With keep-alive, the same connection can carry more requests,
+// so the buffer can hold the next one right after byte 82:
+//
+//   [ request 1: bytes 0-82 ][ request 2: bytes 83-... ]
+//
+// Example with a body: curl.exe -v -d "hello" http://localhost:3000/echo
+//
+//   POST /echo HTTP/1.1\r\n                                -> bytes   0-20
+//   Host: localhost:3000\r\n                               -> bytes  21-42
+//   User-Agent: curl/8.21.0\r\n                            -> bytes  43-67
+//   Accept: */*\r\n                                        -> bytes  68-80
+//   Content-Length: 5\r\n                                  -> bytes  81-99
+//   Content-Type: application/x-www-form-urlencoded        -> bytes 100-146
+//   \r\n\r\n                                               -> bytes 147-150 (index=147)
+//   hello                                                  -> bytes 151-155 (the body)
+//
+//   [ headers: 0-146 ][\r\n\r\n: 147-150][ body: 151-155 ][ next request: 156-... ]
+
+// small helper so every error response looks the same
+function sendError(socket:net.Socket,status:string){
+  socket.end(
+    `HTTP/1.1 ${status}\r\n`+
+    "Content-Length: 0\r\n"+
+    "Connection: close\r\n"+
+    "\r\n"
+  );
+}
+
+const server=net.createServer((socket)=>{
+  console.log("Client is connected");
+
+  // empty bucket for this connection -> <Buffer >, length 0
+  let request=Buffer.alloc(0);
+  let requestsServed=0;
+  let closing=false;
+
+  // no data for 10s -> close the idle connection
+  socket.setTimeout(IDLE_TIMEOUT);
+  socket.on("timeout",()=>{
+    console.log("Idle connection timeout");
+    closing=true;
+    socket.end();
+  });
+
+  socket.on("data",(chunk:Buffer)=>{
+    if(closing) return;
+
+    // TCP can split a request into pieces, so we keep adding them:
+    //   data #1 chunk -> "GET /hello HTTP/1.1\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\n"
+    //   data #2 chunk -> "Host: localhost:3000\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\n"
+    //   data #3 chunk -> "User-Agent: curl/8.21.0\r\nAccept: */*\r\n\r\n"
+    //   request       -> full headers (now contains \r\n\r\n)
+    request=Buffer.concat([request,chunk]);
+
+    // one chunk can contain several requests -> handle them one by one
+    while(true){
+      // where do the headers end?
+      //   not arrived yet -> -1
+      //   GET example     -> 79
+      //   POST example    -> 147
+      const index=request.indexOf("\r\n\r\n");
+
+      if(index===-1){
+        // too big and still no end of headers -> reject
+        // otherwise return, the next "data" event runs Buffer.concat again
+        if(request.length>MAX_HEADER_SIZE){
+          closing=true;
+          sendError(socket,"431 Request Header Fields Too Large");
+        }
+        return; // wait for more data
+      }
+
+      // headers finished but bigger than the limit -> reject
+      if(index+4>MAX_HEADER_SIZE){
+        closing=true;
+        sendError(socket,"431 Request Header Fields Too Large");
+        return;
+      }
+
+      // subarray(0,79) -> header bytes only (without \r\n\r\n)
+      // toString()     -> bytes to text:
+      //   "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\nUser-Agent: curl/8.21.0\r\nAccept: */*"
+      const text=request.subarray(0,index).toString();
+
+      // split("\r\n") ->
+      //   firstLine = "GET /hello HTTP/1.1"
+      //   headers   = ["Host: localhost:3000","User-Agent: curl/8.21.0","Accept: */*"]
+      const [firstLine,...headers]=text.split("\r\n");
+
+      // split(" ") -> ["GET","/hello","HTTP/1.1"]
+      const [method,path,version]=firstLine.split(" ");
+
+      // find the Content-Length header (if any):
+      //   GET example  -> undefined       -> contentLength=0
+      //   POST example -> "Content-Length: 5" -> split(":")[1] = " 5" -> trim -> "5" -> 5
+      const lengthHeader=headers.find(h=>
+        h.toLowerCase().startsWith("content-length:")
+      );
+      let contentLength=0;
+      if(lengthHeader){
+        contentLength=Number(lengthHeader.split(":")[1].trim());
+      }
+
+      // validate BEFORE waiting for the body
+      // (a bad Content-Length like "abc" -> NaN would break the math below)
+      const unsupported=
+        version!=="HTTP/1.1"||
+        (method!=="GET"&&method!=="POST")||
+        headers.some(h=>/^transfer-encoding\s*:/i.test(h))|| // chunked bodies not supported yet
+        !Number.isInteger(contentLength)||
+        contentLength<0;
+
+      if(unsupported){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      if(contentLength>MAX_BODY_SIZE){
+        closing=true;
+        sendError(socket,"413 Content Too Large");
+        return;
+      }
+
+      // where the body is in the buffer (POST example):
+      //   bodyStart   = 147 + 4 = 151
+      //   totalLength = 151 + 5 = 156  -> this request ends at byte 155
+      const bodyStart=index+4;
+      const totalLength=bodyStart+contentLength;
+
+      // body not fully arrived yet -> wait for more data
+      // (we keep the headers in the buffer and parse them again next time)
+      if(request.length<totalLength){
+        return;
+      }
+
+      // subarray(151,156) -> "hello"
+      const requestBody=request.subarray(bodyStart,totalLength).toString();
+
+      // cut off this whole request (headers + body) and keep whatever comes after it:
+      //   only one request -> request = <Buffer >
+      //   two requests     -> request = bytes of request 2
+      request=request.subarray(totalLength);
+
+      console.log("Method:",method);
+      console.log("Path:",path);
+      console.log("Body:",requestBody);
+
+      // routing
+      let status="200 OK";
+      let body="";
+      if(method==="GET"&&path==="/hello"){
+        body="Hello from my tcp server";
+      }else if(method==="GET"&&path==="/health"){
+        body="Server is healthy";
+      }else if(method==="POST"&&path==="/echo"){
+        body=`You sent: ${requestBody}`;
+      }else{
+        status="404 Not Found";
+        body="Route not found";
+      }
+
+      requestsServed++;
+      console.log("Requests on connection:",requestsServed);
+
+      // client sent "Connection: close" -> close after this response
+      // otherwise HTTP/1.1 keeps the connection open (keep-alive)
+      const shouldClose=headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h));
+
+      // response = status line + headers + empty line + body
+      const response=
+        `HTTP/1.1 ${status}\r\n`+
+        "Content-Type: text/plain\r\n"+
+        `Content-Length: ${Buffer.byteLength(body)}\r\n`+
+        `Connection: ${shouldClose?"close":"keep-alive"}\r\n`+
+        "\r\n"+
+        body;
+
+      if(shouldClose){
+        closing=true;
+        socket.end(response); // send and close
+        return;
+      }
+
+      socket.write(response); // send and keep the connection open
+    }
+  });
+
+  socket.on("close",()=>{
+    console.log("Client disconnected");
+  });
+
+  socket.on("error",(err)=>{
+    console.log("Socket error:",err.message);
+  });
+});
+
+// 0.0.0.0 -> listen on every address this PC has (localhost, Wi-Fi IP, ...)
+server.listen(3000,"0.0.0.0",()=>{
+  console.log("TCP server is running on port 3000");
+});
+```
+
+---
+
+### 3.1 What a request with a body looks like
+
+```powershell
+curl.exe -v -d "hello" http://localhost:3000/echo
+```
+
+`-d` means "send this data as the body". curl then switches to `POST` automatically and adds two headers:
+
+```
+> POST /echo HTTP/1.1
+> Host: localhost:3000
+> User-Agent: curl/8.21.0
+> Accept: */*
+> Content-Length: 5                                    ← the body is 5 bytes
+> Content-Type: application/x-www-form-urlencoded      ← the kind of data
+>
+hello                                                  ← the body (5 bytes)
+```
+
+Byte by byte in the buffer:
+
+```
+POST /echo HTTP/1.1\r\n                              -> bytes   0-20
+Host: localhost:3000\r\n                             -> bytes  21-42
+User-Agent: curl/8.21.0\r\n                          -> bytes  43-67
+Accept: */*\r\n                                      -> bytes  68-80
+Content-Length: 5\r\n                                -> bytes  81-99
+Content-Type: application/x-www-form-urlencoded      -> bytes 100-146
+\r\n\r\n                                             -> bytes 147-150   ← index = 147
+hello                                                -> bytes 151-155   ← the body
+```
+
+```
+[ headers: 0-146 ][ \r\n\r\n: 147-150 ][ body: 151-155 ][ next request: 156-... ]
+```
+
+**The key problem:** after `\r\n\r\n`, how does the server know where the body ends and the next request begins? There is no special marker at the end of a body. **`Content-Length` is the only way to know.** It says "the next 5 bytes are the body".
+
+---
+
+### 3.2 Reading `Content-Length`
+
+```ts
+const lengthHeader=headers.find(h=>
+  h.toLowerCase().startsWith("content-length:")
+);
+let contentLength=0;
+if(lengthHeader){
+  contentLength=Number(lengthHeader.split(":")[1].trim());
+}
+```
+
+Step by step for the POST example:
+
+| Step | Value |
+|---|---|
+| `headers.find(...)` | `"Content-Length: 5"`. `find` returns the **first matching item**, or `undefined` |
+| `.split(":")` | `["Content-Length", " 5"]` |
+| `[1]` | `" 5"` |
+| `.trim()` | `"5"`, with the spaces removed |
+| `Number(...)` | `5` |
+
+For a `GET` with no `Content-Length`, `find` returns `undefined`, so `contentLength` stays `0`. A request without a body simply has a 0-byte body.
+
+`toLowerCase()` is needed because header names are **case-insensitive**. `Content-Length`, `content-length` and `CONTENT-LENGTH` all mean the same thing.
+
+---
+
+### 3.3 Validate before waiting
+
+```ts
+const unsupported=
+  version!=="HTTP/1.1"||
+  (method!=="GET"&&method!=="POST")||
+  headers.some(h=>/^transfer-encoding\s*:/i.test(h))||
+  !Number.isInteger(contentLength)||
+  contentLength<0;
+```
+
+| Check | Bad example | Why reject |
+|---|---|---|
+| `version!=="HTTP/1.1"` | `HTTP/1.0` | Only HTTP/1.1 rules are implemented |
+| not `GET` or `POST` | `DELETE` | Other methods aren't supported yet |
+| `Transfer-Encoding` present | `Transfer-Encoding: chunked` | A *chunked* body has no `Content-Length`. It comes in pieces, each with its own size, and needs a different parser |
+| `!Number.isInteger(...)` | `Content-Length: abc` → `NaN`, or `2.5` | Not a valid byte count |
+| `contentLength<0` | `Content-Length: -5` | A negative length makes no sense |
+
+**Why the order matters:** this check runs **before** the body math. If `contentLength` were `NaN`, then `totalLength` would be `NaN`, `request.length<NaN` would always be `false`, and `subarray(NaN)` would quietly return the wrong bytes. So bad input is rejected first, before it can break anything.
+
+**Size limit, `413`:**
+
+```ts
+if(contentLength>MAX_BODY_SIZE){   // 1024*1024 = 1 MB
+  sendError(socket,"413 Content Too Large");
+}
+```
+
+Without it, a client could send `Content-Length: 99999999999`, and the server would keep growing the buffer while it waits for bytes that never stop.
+
+---
+
+### 3.4 Finding and cutting out the body
+
+```ts
+const bodyStart=index+4;                    // 147 + 4 = 151
+const totalLength=bodyStart+contentLength;  // 151 + 5 = 156
+
+if(request.length<totalLength){
+  return;                                   // body not fully here yet -> wait
+}
+
+const requestBody=request.subarray(bodyStart,totalLength).toString();  // bytes 151-155 -> "hello"
+request=request.subarray(totalLength);                                // keep bytes from 156 on
+```
+
+| Name | Meaning | POST example |
+|---|---|---|
+| `index` | where `\r\n\r\n` starts | `147` |
+| `bodyStart` | first byte of the body | `151` |
+| `totalLength` | first byte **after** this request | `156` |
+| `request.length` | how many bytes have arrived so far | `156` if everything is here |
+
+**What if the body is split across chunks?** For a big body, TCP might deliver the headers first and the body later:
+
+| Event | `request.length` | `totalLength` | What happens |
+|---|---|---|---|
+| data #1: headers + `"hel"` | 154 | 156 | `154 < 156`, so `return` and wait. The headers **stay in the buffer** |
+| data #2: `"lo"` | 156 | 156 | full request: read the body, cut it out, respond |
+
+On the second `data` event, the `while` loop starts from the top again. It finds `\r\n\r\n` and re-reads the headers before checking the length. Parsing the headers twice is a little wasteful, but it keeps the code simple.
+
+**Phase 2 vs Phase 3 cutting:**
+
+```ts
+request=request.subarray(index+4);          // Phase 2: cut headers only
+request=request.subarray(totalLength);      // Phase 3: cut headers + body
+```
+
+This is exactly the bug Phase 2 avoided by rejecting bodies. If we cut only the headers, `hello` would stay in the buffer and be parsed as the start of the next request.
+
+---
+
+### 3.5 Routing by method and path
+
+```ts
+if(method==="GET"&&path==="/hello"){
+  body="Hello from my tcp server";
+}else if(method==="GET"&&path==="/health"){
+  body="Server is healthy";
+}else if(method==="POST"&&path==="/echo"){
+  body=`You sent: ${requestBody}`;
+}else{
+  status="404 Not Found";
+  body="Route not found";
+}
+```
+
+| Request | Status | Response body |
+|---|---|---|
+| `GET /hello` | `200 OK` | `Hello from my tcp server` |
+| `GET /health` | `200 OK` | `Server is healthy` |
+| `POST /echo` with body `hello` | `200 OK` | `You sent: hello` |
+| `POST /hello` | `404 Not Found` | `Route not found` |
+| `GET /echo` | `404 Not Found` | `Route not found` |
+
+Two different variables are involved:
+- `requestBody` is what the **client sent** us.
+- `body` is what **we send back**.
+
+They need different names. When both were called `body`, TypeScript refused to compile ("Cannot redeclare block-scoped variable").
+
+---
+
+### 3.6 The `sendError()` helper
+
+```ts
+function sendError(socket:net.Socket,status:string){
+  socket.end(
+    `HTTP/1.1 ${status}\r\n`+
+    "Content-Length: 0\r\n"+
+    "Connection: close\r\n"+
+    "\r\n"
+  );
+}
+```
+
+The `400`, `413` and both `431` responses were the same text with only the status changed, so one function builds all of them. It always closes the connection, because after a bad request we can't trust what's left in the buffer.
+
+---
+
+### 3.7 Try it
+
+```powershell
+curl.exe -v -d "hello" http://localhost:3000/echo                    # 200  You sent: hello
+curl.exe -v -d "hello world" http://localhost:3000/echo              # 200  You sent: hello world
+curl.exe -v http://localhost:3000/hello                              # 200  GET still works
+curl.exe -v -X POST http://localhost:3000/hello                      # 404  wrong method for /hello
+curl.exe -v -X DELETE http://localhost:3000/hello                    # 400  method not supported
+curl.exe -v -H "Content-Length: abc" http://localhost:3000/hello     # 400  bad Content-Length
+curl.exe -v -H "Transfer-Encoding: chunked" -d "hi" http://localhost:3000/echo   # 400  chunked not supported
+```
+
+Server log for the first command:
+
+```
+Client is connected
+Method: POST
+Path: /echo
+Body: hello
+Requests on connection: 1
+Client disconnected
+```
+
+---
+
+## Phase 3 summary
+
+| Feature | Code | Purpose |
+|---|---|---|
+| Read body length | `headers.find(...)` → `Number(...)` | Know how many bytes the body has |
+| Validate first | `Number.isInteger`, `contentLength<0` → `400` | Stop bad input before it breaks the math |
+| Body size limit | `MAX_BODY_SIZE` → `413` | Stop huge bodies from eating memory |
+| Wait for full body | `request.length<totalLength` → `return` | Bodies can arrive in several chunks |
+| Cut headers + body | `request.subarray(totalLength)` | The next request starts in the right place |
+| Echo route | `POST /echo` | Proves the body was read correctly |
+| Error helper | `sendError(socket,status)` | One place builds every error response |
+
+See [Phase 4](#phase-4--hardening--the-event-loop) for what changed next.
+
+---
+
+## **Phase 4 — Hardening & the Event Loop**
+
+Phase 3 trusted `Content-Length` a bit too much. Phase 4 makes that check strict, caps how many requests one connection can make, and adds two test routes that show how Node's **event loop** works.
+
+| | Phase 3 | Phase 4 |
+|---|---|---|
+| Finding `Content-Length` | `headers.find(...)` takes the first one | `headers.filter(...)` collects **all** of them |
+| Two `Content-Length` headers | First one silently wins | `400 Bad Request` |
+| `POST` without `Content-Length` | Treated as an empty body | `411 Length Required` |
+| Bad value (`abc`, `-5`, `2.5`, empty) | `Number(...)`, then `Number.isInteger` / `<0` | Must match `/^\d+$/`, otherwise `400` |
+| Requests per connection | Unlimited | `MAX_REQUESTS=100`, then `Connection: close` |
+| New routes | | `GET /block`, `GET /nonblock` |
+
+### Full code (Phase 4, current `src/index.ts`)
+
+```ts
+import net from "node:net";
+
+const MAX_HEADER_SIZE=8192;
+const MAX_BODY_SIZE=1024*1024; // 1 MB
+const IDLE_TIMEOUT=10_000;
+const MAX_REQUESTS=100;
+
+// Example: curl.exe -v http://localhost:3000/hello
+//
+// What curl sends over TCP (\r\n written out, normally invisible):
+//
+//   GET /hello HTTP/1.1\r\n          -> bytes  0-20
+//   Host: localhost:3000\r\n         -> bytes 21-42
+//   User-Agent: curl/8.21.0\r\n      -> bytes 43-67
+//   Accept: */*                      -> bytes 68-78
+//   \r\n\r\n                         -> bytes 79-82 (end of headers)
+//
+// Raw bytes (hex) in the Buffer:
+//   G  E  T     /  h  e  l  l  o
+//   47 45 54 20 2f 68 65 6c 6c 6f ...
+//
+// With keep-alive, the same connection can carry more requests,
+// so the buffer can hold the next one right after byte 82:
+//
+//   [ request 1: bytes 0-82 ][ request 2: bytes 83-... ]
+//
+// Example with a body: curl.exe -v -d "hello" http://localhost:3000/echo
+//
+//   POST /echo HTTP/1.1\r\n                                -> bytes   0-20
+//   Host: localhost:3000\r\n                               -> bytes  21-42
+//   User-Agent: curl/8.21.0\r\n                            -> bytes  43-67
+//   Accept: */*\r\n                                        -> bytes  68-80
+//   Content-Length: 5\r\n                                  -> bytes  81-99
+//   Content-Type: application/x-www-form-urlencoded        -> bytes 100-146
+//   \r\n\r\n                                               -> bytes 147-150 (index=147)
+//   hello                                                  -> bytes 151-155 (the body)
+//
+//   [ headers: 0-146 ][\r\n\r\n: 147-150][ body: 151-155 ][ next request: 156-... ]
+
+// small helper so every error response looks the same
+function sendError(socket:net.Socket,status:string){
+  socket.end(
+    `HTTP/1.1 ${status}\r\n`+
+    "Content-Length: 0\r\n"+
+    "Connection: close\r\n"+
+    "\r\n"
+  );
+}
+
+const server=net.createServer((socket)=>{
+  console.log("Client is connected");
+
+  // empty bucket for this connection -> <Buffer >, length 0
+  let request=Buffer.alloc(0);
+  let requestsServed=0;
+  let closing=false;
+
+  // no data for 10s -> close the idle connection
+  socket.setTimeout(IDLE_TIMEOUT);
+  socket.on("timeout",()=>{
+    console.log("Idle connection timeout");
+    closing=true;
+    socket.end();
+  });
+
+  socket.on("data",(chunk:Buffer)=>{
+    if(closing) return;
+
+    // TCP can split a request into pieces, so we keep adding them:
+    //   data #1 chunk -> "GET /hello HTTP/1.1\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\n"
+    //   data #2 chunk -> "Host: localhost:3000\r\n"
+    //   request       -> "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\n"
+    //   data #3 chunk -> "User-Agent: curl/8.21.0\r\nAccept: */*\r\n\r\n"
+    //   request       -> full headers (now contains \r\n\r\n)
+    request=Buffer.concat([request,chunk]);
+
+    // one chunk can contain several requests -> handle them one by one
+    while(true){
+      // where do the headers end?
+      //   not arrived yet -> -1
+      //   GET example     -> 79
+      //   POST example    -> 147
+      const index=request.indexOf("\r\n\r\n");
+
+      if(index===-1){
+        // too big and still no end of headers -> reject
+        // otherwise return, the next "data" event runs Buffer.concat again
+        if(request.length>MAX_HEADER_SIZE){
+          closing=true;
+          sendError(socket,"431 Request Header Fields Too Large");
+        }
+        return; // wait for more data
+      }
+
+      // headers finished but bigger than the limit -> reject
+      if(index+4>MAX_HEADER_SIZE){
+        closing=true;
+        sendError(socket,"431 Request Header Fields Too Large");
+        return;
+      }
+
+      // subarray(0,79) -> header bytes only (without \r\n\r\n)
+      // toString()     -> bytes to text:
+      //   "GET /hello HTTP/1.1\r\nHost: localhost:3000\r\nUser-Agent: curl/8.21.0\r\nAccept: */*"
+      const text=request.subarray(0,index).toString();
+
+      // split("\r\n") ->
+      //   firstLine = "GET /hello HTTP/1.1"
+      //   headers   = ["Host: localhost:3000","User-Agent: curl/8.21.0","Accept: */*"]
+      const [firstLine,...headers]=text.split("\r\n");
+
+      // split(" ") -> ["GET","/hello","HTTP/1.1"]
+      const [method,path,version]=firstLine.split(" ");
+
+      // collect every Content-Length header:
+      //   GET example  -> []                     -> contentLength=0
+      //   POST example -> ["Content-Length: 5"]  -> contentLength=5
+      const lengthHeaders=headers.filter(h=>
+        /^content-length:/i.test(h)
+      );
+
+      // two Content-Length headers -> which one is right? reject
+      if(lengthHeaders.length>1){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      // POST must say how big its body is
+      if(method==="POST"&&lengthHeaders.length===0){
+        closing=true;
+        sendError(socket,"411 Length Required");
+        return;
+      }
+
+      let contentLength=0;
+
+      if(lengthHeaders.length===1){
+        // "Content-Length: 5" -> split(":") -> ["Content-Length"," 5"] -> [1] -> " 5" -> trim -> "5"
+        const value=lengthHeaders[0].split(":")[1].trim();
+
+        // only digits allowed: "5" ok, "abc" / "-5" / "2.5" / "" -> 400
+        if(!/^\d+$/.test(value)){
+          closing=true;
+          sendError(socket,"400 Bad Request");
+          return;
+        }
+
+        contentLength=Number(value);
+      }
+
+      // validate BEFORE waiting for the body
+      // (Content-Length is already checked above: digits only)
+      const unsupported=
+        version!=="HTTP/1.1"||
+        (method!=="GET"&&method!=="POST")||
+        headers.some(h=>/^transfer-encoding\s*:/i.test(h)); // chunked bodies not supported yet
+
+      if(unsupported){
+        closing=true;
+        sendError(socket,"400 Bad Request");
+        return;
+      }
+
+      if(contentLength>MAX_BODY_SIZE){
+        closing=true;
+        sendError(socket,"413 Content Too Large");
+        return;
+      }
+
+      // where the body is in the buffer (POST example):
+      //   bodyStart   = 147 + 4 = 151
+      //   totalLength = 151 + 5 = 156  -> this request ends at byte 155
+      const bodyStart=index+4;
+      const totalLength=bodyStart+contentLength;
+
+      // body not fully arrived yet -> wait for more data
+      // (we keep the headers in the buffer and parse them again next time)
+      if(request.length<totalLength){
+        return;
+      }
+
+      // subarray(151,156) -> "hello"
+      const requestBody=request.subarray(bodyStart,totalLength).toString();
+
+      // cut off this whole request (headers + body) and keep whatever comes after it:
+      //   only one request -> request = <Buffer >
+      //   two requests     -> request = bytes of request 2
+      request=request.subarray(totalLength);
+
+      console.log("Method:",method);
+      console.log("Path:",path);
+      console.log("Body:",requestBody);
+
+      // routing
+      let status="200 OK";
+      let body="";
+      
+      if(method==="GET"&&path==="/hello"){
+        body="Hello from my tcp server";
+      }else if(method==="GET" && path==="/block"){
+        console.log("Blocking started")
+        const startTime=Date.now();
+        while(Date.now()-startTime<5000){
+          //this shit is blocking
+        }
+        console.log("Blocking finished")
+        body="Blocking completed"
+      }else if(method=="GET" && path=="/nonblock"){
+        console.log("non blocking started")
+        closing=true;
+        setTimeout(()=>{
+          if(socket.destroyed) return;
+          console.log("Non blocking finished")
+          const result="Non blockign completed"
+          const response=
+      "HTTP/1.1 200 OK\r\n"+
+      "Content-Type: text/plain\r\n"+
+      `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+      "Connection: close\r\n"+
+      "\r\n"+
+      result;
+
+    socket.end(response);
+        },5000);
+        return;
+      }
+      else if(method==="GET"&&path==="/health"){
+        body="Server is healthy";
+      }else if(method==="POST"&&path==="/echo"){
+        body=`You sent: ${requestBody}`;
+      }else{
+        status="404 Not Found";
+        body="Route not found";
+      }
+
+      requestsServed++;
+      console.log("Requests on connection:",requestsServed);
+
+      // client sent "Connection: close" -> close after this response
+      // otherwise HTTP/1.1 keeps the connection open (keep-alive)
+      const shouldClose=
+      headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h))||
+      requestsServed>=MAX_REQUESTS;
+
+      // response = status line + headers + empty line + body
+      const response=
+        `HTTP/1.1 ${status}\r\n`+
+        "Content-Type: text/plain\r\n"+
+        `Content-Length: ${Buffer.byteLength(body)}\r\n`+
+        `Connection: ${shouldClose?"close":"keep-alive"}\r\n`+
+        "\r\n"+
+        body;
+
+      if(shouldClose){
+        closing=true;
+        socket.end(response); // send and close
+        return;
+      }
+
+      socket.write(response); // send and keep the connection open
+    }
+  });
+
+  socket.on("close",()=>{
+    console.log("Client disconnected");
+  });
+
+  socket.on("error",(err)=>{
+    console.log("Socket error:",err.message);
+  });
+});
+
+// 0.0.0.0 -> listen on every address this PC has (localhost, Wi-Fi IP, ...)
+server.listen(3000,"0.0.0.0",()=>{
+  console.log("TCP server is running on port 3000");
+});
+```
+
+---
+
+### 4.1 Collecting every `Content-Length` header
+
+```ts
+const lengthHeaders=headers.filter(h=>
+  /^content-length:/i.test(h)
+);
+```
+
+`find()` stops at the first match, so a request like this used to be accepted:
+
+```
+POST /echo HTTP/1.1
+Content-Length: 5
+Content-Length: 50
+```
+
+Our server would read 5 bytes. A proxy sitting in front of it might read 50. When two programs disagree about where a request ends, an attacker can hide a second request inside the body of the first. This is called **request smuggling**. `filter()` returns every match, so we can see that there are two and refuse the request:
+
+| `lengthHeaders` | Meaning | Result |
+|---|---|---|
+| `[]` | No body | `contentLength=0` (or `411` for `POST`) |
+| `["Content-Length: 5"]` | One clear length | Read 5 bytes |
+| `["Content-Length: 5","Content-Length: 50"]` | Conflicting lengths | `400 Bad Request` |
+
+The regex `/^content-length:/i` means: starts with `content-length:`, case-insensitive (`i`), so `Content-Length`, `content-length` and `CONTENT-LENGTH` all match.
+
+---
+
+### 4.2 `411 Length Required`
+
+```ts
+if(method==="POST"&&lengthHeaders.length===0){
+  closing=true;
+  sendError(socket,"411 Length Required");
+  return;
+}
+```
+
+Without `Content-Length` (and without chunked encoding, which we don't support), the server has no way to know where a `POST` body ends. Rather than guessing "empty", we tell the client exactly what is missing. `411` is the status code made for this.
+
+A `GET` without `Content-Length` is still fine: it simply has no body.
+
+---
+
+### 4.3 Digits only
+
+```ts
+const value=lengthHeaders[0].split(":")[1].trim();
+
+if(!/^\d+$/.test(value)){
+  closing=true;
+  sendError(socket,"400 Bad Request");
+  return;
+}
+
+contentLength=Number(value);
+```
+
+`/^\d+$/` means: from start (`^`) to end (`$`), one or more (`+`) digits (`\d`), nothing else.
+
+| Value | Phase 3 `Number(...)` | Phase 4 regex |
+|---|---|---|
+| `"5"` | `5` ✅ | ✅ |
+| `"abc"` | `NaN` → rejected | ❌ `400` |
+| `"-5"` | `-5` → rejected | ❌ `400` |
+| `"2.5"` | `2.5` → rejected | ❌ `400` |
+| `""` | `0` ✅ (wrong!) | ❌ `400` |
+| `" 5 "` | `5` (after `trim`) | ✅ |
+| `"0x10"` | `16` ✅ (wrong!) | ❌ `400` |
+
+`Number()` is too forgiving: it turns `""` into `0` and `"0x10"` into `16`. Checking the text **before** converting it means only plain decimal numbers get through. That is also why `!Number.isInteger(contentLength)||contentLength<0` could be removed from the `unsupported` check.
+
+---
+
+### 4.4 `MAX_REQUESTS`: limit per connection
+
+```ts
+const MAX_REQUESTS=100;
+...
+const shouldClose=
+  headers.some(h=>/^connection\s*:\s*close\s*$/i.test(h))||
+  requestsServed>=MAX_REQUESTS;
+```
+
+With keep-alive, one client could hold a single connection open forever and keep sending requests. After the 100th response on a connection, the server replies with `Connection: close` and ends it. A well-behaved client (like a browser) just opens a new connection. Real servers do the same thing: nginx's `keepalive_requests` defaults to 1000.
+
+---
+
+### 4.5 The event loop: `/block` vs `/nonblock`
+
+Node runs all of our JavaScript on **one thread**. That thread runs a loop:
+
+```
+┌──────────────────────────────┐
+│ is there an event waiting?   │ <── new connection, "data" chunk,
+│   yes -> run its callback    │     timer finished, ...
+│   no  -> wait                │
+└──────────────────────────────┘
+```
+
+While one callback is running, nothing else can run. Every client shares that one thread.
+
+#### `/block`: keeps the thread busy
+
+```ts
+}else if(method==="GET" && path==="/block"){
+  console.log("Blocking started")
+  const startTime=Date.now();
+  while(Date.now()-startTime<5000){
+    // busy loop: checks the clock over and over for 5 seconds
+  }
+  console.log("Blocking finished")
+  body="Blocking completed"
+}
+```
+
+The `while` loop never gives control back to the event loop. For 5 seconds, the server can't accept connections, read data, or answer anyone, even a request to `/hello`.
+
+#### `/nonblock`: hands the wait to a timer
+
+```ts
+}else if(method=="GET" && path=="/nonblock"){
+  console.log("non blocking started")
+  closing=true;
+  setTimeout(()=>{
+    if(socket.destroyed) return;
+    console.log("Non blocking finished")
+    const result="Non blockign completed"
+    const response=
+      "HTTP/1.1 200 OK\r\n"+
+      "Content-Type: text/plain\r\n"+
+      `Content-Length: ${Buffer.byteLength(result)}\r\n`+
+      "Connection: close\r\n"+
+      "\r\n"+
+      result;
+    socket.end(response);
+  },5000);
+  return;
+}
+```
+
+`setTimeout` registers "run this in 5 seconds" and returns **immediately**. The `"data"` callback ends, and the thread goes back to serving other clients. After 5 seconds the timer fires and the response is sent.
+
+Details in this route:
+
+| Line | Why |
+|---|---|
+| `closing=true` | The response is sent later, so ignore anything else arriving on this connection meanwhile |
+| `return` | Skip the normal response code below; the timer sends the response |
+| `if(socket.destroyed) return` | The client may have hung up (Ctrl + C) during the 5 seconds; don't write to a dead socket |
+| `Connection: close` | Keeps it simple: one delayed response, then the connection ends |
+
+#### Timeline
+
+```
+/block:
+  t=0s  client A: GET /block   -> thread stuck in while loop
+  t=1s  client B: GET /hello   -> waits... (nobody can read it)
+  t=5s  A gets "Blocking completed"
+        B gets "Hello from my tcp server"   (B waited ~4s for nothing)
+
+/nonblock:
+  t=0s  client A: GET /nonblock -> timer set, thread free
+  t=1s  client B: GET /hello    -> answered right away
+  t=5s  timer fires -> A gets the response
+```
+
+**Lesson:** never do long synchronous work (big loops, `fs.readFileSync` on huge files, heavy crypto) inside a request handler. Use async APIs so the thread stays free.
+
+---
+
+### 4.6 Try it
+
+```powershell
+curl.exe -v -d "hello" http://localhost:3000/echo                                        # 200  You sent: hello
+curl.exe -v -X POST http://localhost:3000/echo                                           # 411  no Content-Length
+curl.exe -v -H "Content-Length: 5" -H "Content-Length: 50" http://localhost:3000/hello   # 400  two Content-Length
+curl.exe -v -H "Content-Length: -5" http://localhost:3000/hello                          # 400  not digits
+curl.exe -v -H "Content-Length: 0x10" http://localhost:3000/hello                        # 400  not digits
+```
+
+Timing each route:
+
+```powershell
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/block      # ~5s
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/nonblock   # ~5s
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/hello      # ~0.003s
+```
+
+Both take about 5 seconds **on their own**. The difference only shows when a second request comes in during the wait. Open two terminals:
+
+```powershell
+# Terminal 1
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/block
+
+# Terminal 2, right after starting terminal 1
+curl.exe -w "\nTime: %{time_total}s\n" http://127.0.0.1:3000/hello
+```
+
+| Terminal 1 route | `/hello` time in terminal 2 |
+|---|---|
+| `/block` | ~4–5s (stuck behind the busy loop) |
+| `/nonblock` | ~0.003s (answered immediately) |
+
+> Note: a wrong path such as `/unblock` returns `404 Route not found` instantly, which can look like a fast "non-blocking" response. The route is `/nonblock`.
+
+---
+
+## Phase 4 summary
+
+| Feature | Code | Purpose |
+|---|---|---|
+| All `Content-Length` headers | `headers.filter(...)` | Detect duplicates |
+| Duplicate length | `lengthHeaders.length>1` → `400` | Prevent request smuggling |
+| Missing length on `POST` | → `411 Length Required` | Server can't guess where the body ends |
+| Strict number | `/^\d+$/` → `400` | Reject `""`, `-5`, `2.5`, `0x10` before `Number()` |
+| Request limit | `MAX_REQUESTS` → `Connection: close` | One client can't hold a connection forever |
+| Blocking route | `while` loop in `/block` | Shows one busy callback freezes every client |
+| Non-blocking route | `setTimeout` in `/nonblock` | Shows waiting without holding the thread |
+
+**Next: Phase 5** will turn the headers into an object (`{ host: "localhost:3000", ... }`), handle query strings (`/hello?name=x`), and move the parsing into its own `parser.ts`.
